@@ -10,7 +10,9 @@ See the Mulan PSL v2 for more details. */
 
 #include "lru_replacer.h"
 
-LRUReplacer::LRUReplacer(size_t num_pages) { max_size_ = num_pages; }
+LRUReplacer::LRUReplacer(size_t num_pages) { 
+    max_size_ = num_pages; 
+}
 
 LRUReplacer::~LRUReplacer() = default;  
 
@@ -28,6 +30,15 @@ bool LRUReplacer::victim(frame_id_t* frame_id) {
     //  利用lru_replacer中的LRUlist_,LRUHash_实现LRU策略
     //  选择合适的frame指定为淘汰页面,赋值给*frame_id
 
+    if (LRUlist_.empty()) {
+        return false;
+    }
+
+    // 淘汰链表尾部的frame（最久未使用的）
+    *frame_id = LRUlist_.back();
+    LRUlist_.pop_back();
+    LRUhash_.erase(*frame_id);
+
     return true;
 }
 
@@ -37,9 +48,17 @@ bool LRUReplacer::victim(frame_id_t* frame_id) {
  */
 void LRUReplacer::pin(frame_id_t frame_id) {
     std::scoped_lock lock{latch_};
+    
     // Todo:
     // 固定指定id的frame
     // 在数据结构中移除该frame
+
+    // 如果frame在LRU中，将其移除
+    auto it = LRUhash_.find(frame_id);
+    if (it != LRUhash_.end()) {
+        LRUlist_.erase(it->second);
+        LRUhash_.erase(it);
+    }
 }
 
 /**
@@ -50,9 +69,30 @@ void LRUReplacer::unpin(frame_id_t frame_id) {
     // Todo:
     //  支持并发锁
     //  选择一个frame取消固定
+    std::scoped_lock lock{latch_};
+    
+    // 关键修改：如果frame已经在LRU中，不进行任何操作
+    // 这样第二次unpin同一个frame不会改变它的位置
+    if (LRUhash_.find(frame_id) != LRUhash_.end()) {
+        return;
+    }
+    
+    // 如果LRU已满，淘汰最久未使用的frame
+    if (LRUlist_.size() >= max_size_) {
+        frame_id_t victim_frame = LRUlist_.back();
+        LRUlist_.pop_back();
+        LRUhash_.erase(victim_frame);
+    }
+    
+    // 将frame添加到链表头部（最近使用）
+    LRUlist_.push_front(frame_id);
+    LRUhash_[frame_id] = LRUlist_.begin();
 }
 
 /**
  * @description: 获取当前replacer中可以被淘汰的页面数量
  */
-size_t LRUReplacer::Size() { return LRUlist_.size(); }
+size_t LRUReplacer::Size() { 
+    std::scoped_lock lock{latch_};
+    return LRUlist_.size(); 
+}
