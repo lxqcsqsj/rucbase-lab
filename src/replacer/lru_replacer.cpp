@@ -34,7 +34,7 @@ bool LRUReplacer::victim(frame_id_t* frame_id) {
         return false;
     }
 
-    // 淘汰链表尾部的frame（最久未使用的）
+    // 淘汰链表尾部的frame
     *frame_id = LRUlist_.back();
     LRUlist_.pop_back();
     LRUhash_.erase(*frame_id);
@@ -71,8 +71,7 @@ void LRUReplacer::unpin(frame_id_t frame_id) {
     //  选择一个frame取消固定
     std::scoped_lock lock{latch_};
     
-    // 关键修改：如果frame已经在LRU中，不进行任何操作
-    // 这样第二次unpin同一个frame不会改变它的位置
+    // 如果frame已经在LRU中，不进行任何操作，这样第二次unpin同一个frame不会改变它的位置
     if (LRUhash_.find(frame_id) != LRUhash_.end()) {
         return;
     }

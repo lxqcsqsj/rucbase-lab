@@ -17,7 +17,6 @@ See the Mulan PSL v2 for more details. */
 
 #include "defs.h"
 
-// 修复构造函数 - 不使用 memset
 DiskManager::DiskManager() { 
     for (int i = 0; i < MAX_FD; ++i) {
         fd2pageno_[i] = 0;
@@ -26,6 +25,10 @@ DiskManager::DiskManager() {
 
 /**
  * @description: 将数据写入文件的指定磁盘页面中
+ * @param {int} fd 磁盘文件的文件句柄
+ * @param {page_id_t} page_no 写入目标页面的page_id
+ * @param {char} *offset 要写入磁盘的数据
+ * @param {int} num_bytes 要写入磁盘的数据大小
  */
 void DiskManager::write_page(int fd, page_id_t page_no, const char *offset, int num_bytes) {
     // 计算页面在文件中的偏移量
@@ -45,6 +48,10 @@ void DiskManager::write_page(int fd, page_id_t page_no, const char *offset, int 
 
 /**
  * @description: 读取文件中指定编号的页面中的部分数据到内存中
+ * @param {int} fd 磁盘文件的文件句柄
+ * @param {page_id_t} page_no 指定的页面编号
+ * @param {char} *offset 读取的内容写入到offset中
+ * @param {int} num_bytes 读取的数据量大小
  */
 void DiskManager::read_page(int fd, page_id_t page_no, char *offset, int num_bytes) {
     // 计算页面在文件中的偏移量
@@ -64,6 +71,8 @@ void DiskManager::read_page(int fd, page_id_t page_no, char *offset, int num_byt
 
 /**
  * @description: 分配一个新的页号
+ * @return {page_id_t} 分配的新页号
+ * @param {int} fd 指定文件的文件句柄
  */
 page_id_t DiskManager::allocate_page(int fd) {
     // 简单的自增分配策略，指定文件的页面编号加1
@@ -95,6 +104,8 @@ void DiskManager::destroy_dir(const std::string &path) {
 
 /**
  * @description: 判断指定路径文件是否存在
+ * @return {bool} 若指定路径文件存在则返回true 
+ * @param {string} &path 指定路径文件
  */
 bool DiskManager::is_file(const std::string &path) {
     // 用struct stat获取文件信息
@@ -104,6 +115,8 @@ bool DiskManager::is_file(const std::string &path) {
 
 /**
  * @description: 用于创建指定路径文件
+ * @return {*}
+ * @param {string} &path
  */
 void DiskManager::create_file(const std::string &path) {
     // 检查文件是否已存在
@@ -123,6 +136,7 @@ void DiskManager::create_file(const std::string &path) {
 
 /**
  * @description: 删除指定路径的文件
+ * @param {string} &path 文件所在路径
  */
 void DiskManager::destroy_file(const std::string &path) {
     // 检查文件是否存在
@@ -143,6 +157,8 @@ void DiskManager::destroy_file(const std::string &path) {
 
 /**
  * @description: 打开指定路径文件 
+ * @return {int} 返回打开的文件的文件句柄
+ * @param {string} &path 文件所在路径
  */
 int DiskManager::open_file(const std::string &path) {
     // 检查文件是否存在
@@ -170,9 +186,10 @@ int DiskManager::open_file(const std::string &path) {
 
 /**
  * @description:用于关闭指定路径文件 
+ * @param {int} fd 打开的文件的文件句柄
  */
 void DiskManager::close_file(int fd) {
-    // 检查文件句柄是否有效
+    // 检查文件是否有效
     if (!fd2path_.count(fd)) {
         throw FileNotOpenError(fd);
     }
@@ -190,6 +207,8 @@ void DiskManager::close_file(int fd) {
 
 /**
  * @description: 获得文件的大小
+ * @return {int} 文件的大小
+ * @param {string} &file_name 文件名
  */
 int DiskManager::get_file_size(const std::string &file_name) {
     struct stat stat_buf;
@@ -199,6 +218,8 @@ int DiskManager::get_file_size(const std::string &file_name) {
 
 /**
  * @description: 根据文件句柄获得文件名
+ * @return {string} 文件句柄对应文件的文件名
+ * @param {int} fd 文件句柄
  */
 std::string DiskManager::get_file_name(int fd) {
     if (!fd2path_.count(fd)) {
@@ -209,6 +230,8 @@ std::string DiskManager::get_file_name(int fd) {
 
 /**
  * @description:  获得文件名对应的文件句柄
+ * @return {int} 文件句柄
+ * @param {string} &file_name 文件名
  */
 int DiskManager::get_file_fd(const std::string &file_name) {
     if (!path2fd_.count(file_name)) {
@@ -219,6 +242,10 @@ int DiskManager::get_file_fd(const std::string &file_name) {
 
 /**
  * @description:  读取日志文件内容
+ * @return {int} 返回读取的数据量，若为-1说明读取数据的起始位置超过了文件大小
+ * @param {char} *log_data 读取内容到log_data中
+ * @param {int} size 读取的数据量大小
+ * @param {int} offset 读取的内容在文件中的位置
  */
 int DiskManager::read_log(char *log_data, int size, int offset) {
     // read log file from the previous end
@@ -240,6 +267,8 @@ int DiskManager::read_log(char *log_data, int size, int offset) {
 
 /**
  * @description: 写日志内容
+ * @param {char} *log_data 要写入的日志内容
+ * @param {int} size 要写入的内容大小
  */
 void DiskManager::write_log(char *log_data, int size) {
     if (log_fd_ == -1) {
