@@ -43,16 +43,191 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
 
     }
 
-    void beginTuple() override {
+    size_t tupleLen() const override { return len_; }
 
+    const std::vector<ColMeta> &cols() const override { return cols_; }
+
+    bool is_end() const override { return isend; }
+
+    ColMeta get_col_offset(const TabCol &target) override { return *get_col(cols_, target); }
+
+    void beginTuple() override {
+        isend = false;
+        left_->beginTuple();
+        if (left_->is_end()) {
+            isend = true;
+            return;
+        }
+        right_->beginTuple();
+        if (right_->is_end()) {
+            isend = true;
+            return;
+        }
+
+        auto cmp = [](ColType type, const char *lhs, const char *rhs, int len) -> int {
+            switch (type) {
+                case TYPE_INT: {
+                    int a = *reinterpret_cast<const int *>(lhs);
+                    int b = *reinterpret_cast<const int *>(rhs);
+                    return (a < b) ? -1 : ((a > b) ? 1 : 0);
+                }
+                case TYPE_FLOAT: {
+                    float a = *reinterpret_cast<const float *>(lhs);
+                    float b = *reinterpret_cast<const float *>(rhs);
+                    return (a < b) ? -1 : ((a > b) ? 1 : 0);
+                }
+                case TYPE_STRING:
+                    return memcmp(lhs, rhs, len);
+                default:
+                    throw InternalError("Unexpected data type");
+            }
+        };
+
+        auto eval_cond = [&](const Condition &cond, const RmRecord &rec) -> bool {
+            auto lhs_it = get_col(cols_, cond.lhs_col);
+            const auto &lhs = *lhs_it;
+            const char *lhs_ptr = rec.data + lhs.offset;
+            const char *rhs_ptr = nullptr;
+            if (cond.is_rhs_val) {
+                rhs_ptr = cond.rhs_val.raw->data;
+            } else {
+                auto rhs_it = get_col(cols_, cond.rhs_col);
+                rhs_ptr = rec.data + rhs_it->offset;
+            }
+            int c = cmp(lhs.type, lhs_ptr, rhs_ptr, lhs.len);
+            switch (cond.op) {
+                case OP_EQ: return c == 0;
+                case OP_NE: return c != 0;
+                case OP_LT: return c < 0;
+                case OP_GT: return c > 0;
+                case OP_LE: return c <= 0;
+                case OP_GE: return c >= 0;
+                default: throw InternalError("Unexpected comparison operator");
+            }
+        };
+
+        auto eval_conds = [&](const RmRecord &rec) -> bool {
+            for (auto &cond : fed_conds_) {
+                if (!eval_cond(cond, rec)) return false;
+            }
+            return true;
+        };
+
+        auto curr_match = [&]() -> bool {
+            auto l = left_->Next();
+            auto r = right_->Next();
+            if (l == nullptr || r == nullptr) return false;
+            RmRecord joined(static_cast<int>(len_));
+            memcpy(joined.data, l->data, left_->tupleLen());
+            memcpy(joined.data + left_->tupleLen(), r->data, right_->tupleLen());
+            return eval_conds(joined);
+        };
+
+        while (!left_->is_end()) {
+            while (!right_->is_end()) {
+                if (fed_conds_.empty() || curr_match()) {
+                    return;
+                }
+                right_->nextTuple();
+            }
+            left_->nextTuple();
+            if (left_->is_end()) break;
+            right_->beginTuple();
+        }
+        isend = true;
     }
 
     void nextTuple() override {
-        
+        if (isend) return;
+
+        right_->nextTuple();
+
+        auto cmp = [](ColType type, const char *lhs, const char *rhs, int len) -> int {
+            switch (type) {
+                case TYPE_INT: {
+                    int a = *reinterpret_cast<const int *>(lhs);
+                    int b = *reinterpret_cast<const int *>(rhs);
+                    return (a < b) ? -1 : ((a > b) ? 1 : 0);
+                }
+                case TYPE_FLOAT: {
+                    float a = *reinterpret_cast<const float *>(lhs);
+                    float b = *reinterpret_cast<const float *>(rhs);
+                    return (a < b) ? -1 : ((a > b) ? 1 : 0);
+                }
+                case TYPE_STRING:
+                    return memcmp(lhs, rhs, len);
+                default:
+                    throw InternalError("Unexpected data type");
+            }
+        };
+
+        auto eval_cond = [&](const Condition &cond, const RmRecord &rec) -> bool {
+            auto lhs_it = get_col(cols_, cond.lhs_col);
+            const auto &lhs = *lhs_it;
+            const char *lhs_ptr = rec.data + lhs.offset;
+            const char *rhs_ptr = nullptr;
+            if (cond.is_rhs_val) {
+                rhs_ptr = cond.rhs_val.raw->data;
+            } else {
+                auto rhs_it = get_col(cols_, cond.rhs_col);
+                rhs_ptr = rec.data + rhs_it->offset;
+            }
+            int c = cmp(lhs.type, lhs_ptr, rhs_ptr, lhs.len);
+            switch (cond.op) {
+                case OP_EQ: return c == 0;
+                case OP_NE: return c != 0;
+                case OP_LT: return c < 0;
+                case OP_GT: return c > 0;
+                case OP_LE: return c <= 0;
+                case OP_GE: return c >= 0;
+                default: throw InternalError("Unexpected comparison operator");
+            }
+        };
+
+        auto eval_conds = [&](const RmRecord &rec) -> bool {
+            for (auto &cond : fed_conds_) {
+                if (!eval_cond(cond, rec)) return false;
+            }
+            return true;
+        };
+
+        auto curr_match = [&]() -> bool {
+            auto l = left_->Next();
+            auto r = right_->Next();
+            if (l == nullptr || r == nullptr) return false;
+            RmRecord joined(static_cast<int>(len_));
+            memcpy(joined.data, l->data, left_->tupleLen());
+            memcpy(joined.data + left_->tupleLen(), r->data, right_->tupleLen());
+            return eval_conds(joined);
+        };
+
+        while (!left_->is_end()) {
+            while (!right_->is_end()) {
+                if (fed_conds_.empty() || curr_match()) {
+                    return;
+                }
+                right_->nextTuple();
+            }
+            left_->nextTuple();
+            if (left_->is_end()) break;
+            right_->beginTuple();
+        }
+        isend = true;
     }
 
     std::unique_ptr<RmRecord> Next() override {
-        return nullptr;
+        if (isend) {
+            return nullptr;
+        }
+        auto l = left_->Next();
+        auto r = right_->Next();
+        if (l == nullptr || r == nullptr) {
+            return nullptr;
+        }
+        auto rec = std::make_unique<RmRecord>(static_cast<int>(len_));
+        memcpy(rec->data, l->data, left_->tupleLen());
+        memcpy(rec->data + left_->tupleLen(), r->data, right_->tupleLen());
+        return rec;
     }
 
     Rid &rid() override { return _abstract_rid; }

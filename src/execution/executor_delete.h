@@ -37,6 +37,25 @@ class DeleteExecutor : public AbstractExecutor {
     }
 
     std::unique_ptr<RmRecord> Next() override {
+        // 对每个 rid：先删索引 entry，再删记录
+        for (auto &rid : rids_) {
+            auto rec = fh_->get_record(rid, context_);
+            if (rec == nullptr) {
+                continue;
+            }
+            for (auto &index : tab_.indexes) {
+                std::vector<char> key(index.col_tot_len);
+                int off = 0;
+                for (int i = 0; i < index.col_num; i++) {
+                    auto &col = index.cols[i];
+                    memcpy(key.data() + off, rec->data + col.offset, col.len);
+                    off += col.len;
+                }
+                auto ih = sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols)).get();
+                ih->delete_entry(key.data(), context_ ? context_->txn_ : nullptr);
+            }
+            fh_->delete_record(rid, context_);
+        }
         return nullptr;
     }
 

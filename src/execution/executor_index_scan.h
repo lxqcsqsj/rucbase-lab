@@ -64,16 +64,175 @@ class IndexScanExecutor : public AbstractExecutor {
         fed_conds_ = conds_;
     }
 
+    size_t tupleLen() const override { return len_; }
+
+    const std::vector<ColMeta> &cols() const override { return cols_; }
+
+    bool is_end() const override { return scan_ == nullptr || scan_->is_end(); }
+
+    ColMeta get_col_offset(const TabCol &target) override { return *get_col(cols_, target); }
+
     void beginTuple() override {
-        
+        // 先尝试用索引构建等值 key 区间扫描；如果条件不满足，退化为顺序扫描
+        bool can_use_index = true;
+        std::vector<char> key(index_meta_.col_tot_len, 0);
+        int off = 0;
+        for (auto &col : index_meta_.cols) {
+            bool found = false;
+            for (auto &cond : conds_) {
+                if (cond.is_rhs_val && cond.op == OP_EQ &&
+                    cond.lhs_col.tab_name == tab_name_ && cond.lhs_col.col_name == col.name) {
+                    memcpy(key.data() + off, cond.rhs_val.raw->data, col.len);
+                    off += col.len;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                can_use_index = false;
+                break;
+            }
+        }
+
+        if (can_use_index && !index_col_names_.empty()) {
+            auto ih = sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index_col_names_)).get();
+            auto lower = ih->lower_bound(key.data());
+            auto upper = ih->upper_bound(key.data());
+            scan_ = std::make_unique<IxScan>(ih, lower, upper, sm_manager_->get_bpm());
+        } else {
+            scan_ = std::make_unique<RmScan>(fh_);
+        }
+
+        // 前进到第一个满足所有谓词的记录
+        auto cmp = [](ColType type, const char *lhs, const char *rhs, int len) -> int {
+            switch (type) {
+                case TYPE_INT: {
+                    int a = *reinterpret_cast<const int *>(lhs);
+                    int b = *reinterpret_cast<const int *>(rhs);
+                    return (a < b) ? -1 : ((a > b) ? 1 : 0);
+                }
+                case TYPE_FLOAT: {
+                    float a = *reinterpret_cast<const float *>(lhs);
+                    float b = *reinterpret_cast<const float *>(rhs);
+                    return (a < b) ? -1 : ((a > b) ? 1 : 0);
+                }
+                case TYPE_STRING:
+                    return memcmp(lhs, rhs, len);
+                default:
+                    throw InternalError("Unexpected data type");
+            }
+        };
+
+        auto eval_cond = [&](const Condition &cond, const RmRecord &rec) -> bool {
+            auto lhs_it = get_col(cols_, cond.lhs_col);
+            const auto &lhs = *lhs_it;
+            const char *lhs_ptr = rec.data + lhs.offset;
+            const char *rhs_ptr = nullptr;
+            if (cond.is_rhs_val) {
+                rhs_ptr = cond.rhs_val.raw->data;
+            } else {
+                auto rhs_it = get_col(cols_, cond.rhs_col);
+                rhs_ptr = rec.data + rhs_it->offset;
+            }
+            int c = cmp(lhs.type, lhs_ptr, rhs_ptr, lhs.len);
+            switch (cond.op) {
+                case OP_EQ: return c == 0;
+                case OP_NE: return c != 0;
+                case OP_LT: return c < 0;
+                case OP_GT: return c > 0;
+                case OP_LE: return c <= 0;
+                case OP_GE: return c >= 0;
+                default: throw InternalError("Unexpected comparison operator");
+            }
+        };
+
+        auto eval_conds = [&](const RmRecord &rec) -> bool {
+            for (auto &cond : fed_conds_) {
+                if (!eval_cond(cond, rec)) return false;
+            }
+            return true;
+        };
+
+        while (!scan_->is_end()) {
+            rid_ = scan_->rid();
+            auto rec = fh_->get_record(rid_, context_);
+            if (rec != nullptr && eval_conds(*rec)) {
+                return;
+            }
+            scan_->next();
+        }
     }
 
     void nextTuple() override {
-        
+        if (scan_ == nullptr || scan_->is_end()) {
+            return;
+        }
+        scan_->next();
+
+        auto cmp = [](ColType type, const char *lhs, const char *rhs, int len) -> int {
+            switch (type) {
+                case TYPE_INT: {
+                    int a = *reinterpret_cast<const int *>(lhs);
+                    int b = *reinterpret_cast<const int *>(rhs);
+                    return (a < b) ? -1 : ((a > b) ? 1 : 0);
+                }
+                case TYPE_FLOAT: {
+                    float a = *reinterpret_cast<const float *>(lhs);
+                    float b = *reinterpret_cast<const float *>(rhs);
+                    return (a < b) ? -1 : ((a > b) ? 1 : 0);
+                }
+                case TYPE_STRING:
+                    return memcmp(lhs, rhs, len);
+                default:
+                    throw InternalError("Unexpected data type");
+            }
+        };
+
+        auto eval_cond = [&](const Condition &cond, const RmRecord &rec) -> bool {
+            auto lhs_it = get_col(cols_, cond.lhs_col);
+            const auto &lhs = *lhs_it;
+            const char *lhs_ptr = rec.data + lhs.offset;
+            const char *rhs_ptr = nullptr;
+            if (cond.is_rhs_val) {
+                rhs_ptr = cond.rhs_val.raw->data;
+            } else {
+                auto rhs_it = get_col(cols_, cond.rhs_col);
+                rhs_ptr = rec.data + rhs_it->offset;
+            }
+            int c = cmp(lhs.type, lhs_ptr, rhs_ptr, lhs.len);
+            switch (cond.op) {
+                case OP_EQ: return c == 0;
+                case OP_NE: return c != 0;
+                case OP_LT: return c < 0;
+                case OP_GT: return c > 0;
+                case OP_LE: return c <= 0;
+                case OP_GE: return c >= 0;
+                default: throw InternalError("Unexpected comparison operator");
+            }
+        };
+
+        auto eval_conds = [&](const RmRecord &rec) -> bool {
+            for (auto &cond : fed_conds_) {
+                if (!eval_cond(cond, rec)) return false;
+            }
+            return true;
+        };
+
+        while (!scan_->is_end()) {
+            rid_ = scan_->rid();
+            auto rec = fh_->get_record(rid_, context_);
+            if (rec != nullptr && eval_conds(*rec)) {
+                return;
+            }
+            scan_->next();
+        }
     }
 
     std::unique_ptr<RmRecord> Next() override {
-        return nullptr;
+        if (is_end()) {
+            return nullptr;
+        }
+        return fh_->get_record(rid_, context_);
     }
 
     Rid &rid() override { return rid_; }
