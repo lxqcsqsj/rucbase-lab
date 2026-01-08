@@ -10,6 +10,7 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
+#include <climits>
 #include "execution_defs.h"
 #include "execution_manager.h"
 #include "executor_abstract.h"
@@ -73,33 +74,129 @@ class IndexScanExecutor : public AbstractExecutor {
     ColMeta get_col_offset(const TabCol &target) override { return *get_col(cols_, target); }
 
     void beginTuple() override {
-        // 先尝试用索引构建等值 key 区间扫描；如果条件不满足，退化为顺序扫描
-        bool can_use_index = true;
-        std::vector<char> key(index_meta_.col_tot_len, 0);
-        int off = 0;
-        for (auto &col : index_meta_.cols) {
-            bool found = false;
-            for (auto &cond : conds_) {
-                if (cond.is_rhs_val && cond.op == OP_EQ &&
-                    cond.lhs_col.tab_name == tab_name_ && cond.lhs_col.col_name == col.name) {
-                    memcpy(key.data() + off, cond.rhs_val.raw->data, col.len);
-                    off += col.len;
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-                can_use_index = false;
-                break;
+        // 申请IS意向锁（表级）
+        if (context_ != nullptr && context_->txn_ != nullptr && context_->lock_mgr_ != nullptr) {
+            int tab_fd = fh_->GetFd();
+            if (!context_->lock_mgr_->lock_IS_on_table(context_->txn_, tab_fd)) {
+                throw std::runtime_error("Failed to acquire IS lock on table");
             }
         }
-
-        if (can_use_index && !index_col_names_.empty()) {
+        
+        // 使用索引进行扫描，并在键空间上加“间隙共享锁”，防止幻读
+        // 如果有WHERE条件匹配索引列，使用等值或范围扫描
+        // 如果没有WHERE条件，使用索引进行全表扫描（保证输出顺序一致）
+        if (!index_col_names_.empty()) {
             auto ih = sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index_col_names_)).get();
-            auto lower = ih->lower_bound(key.data());
-            auto upper = ih->upper_bound(key.data());
+            
+            // 初始化扫描范围为全表
+            Iid lower = ih->leaf_begin();
+            Iid upper = ih->leaf_end();
+            
+            // 计算间隙锁的范围（left_key, right_key）
+            int left_key = INT_MIN;
+            int right_key = INT_MAX;
+            bool has_range = false;
+            
+            // 检查第一个索引列是否有范围条件（支持单列索引的范围查询，如 id > 2 and id < 4）
+            if (index_meta_.cols.size() == 1 && index_meta_.cols[0].type == TYPE_INT) {
+                const std::string& first_col_name = index_meta_.cols[0].name;
+                char* range_key = new char[index_meta_.cols[0].len];
+                
+                for (auto &cond : conds_) {
+                    if (cond.is_rhs_val && cond.lhs_col.tab_name == tab_name_ && 
+                        cond.lhs_col.col_name == first_col_name) {
+                        memcpy(range_key, cond.rhs_val.raw->data, index_meta_.cols[0].len);
+                        int key_val = *reinterpret_cast<int*>(range_key);
+                        
+                        if (cond.op == OP_EQ) {
+                            // 等值查询：锁住 [key, key] 区间
+                            left_key = key_val;
+                            right_key = key_val;
+                            has_range = true;
+                            lower = ih->lower_bound(range_key);
+                            upper = ih->upper_bound(range_key);
+                            break;
+                        } else if (cond.op == OP_GT) {
+                            // id > key: 从第一个 > key 的位置开始
+                            left_key = key_val + 1;  // 不包含key本身
+                            has_range = true;
+                            lower = ih->upper_bound(range_key);
+                        } else if (cond.op == OP_GE) {
+                            // id >= key: 从第一个 >= key 的位置开始
+                            left_key = key_val;  // 包含key本身
+                            has_range = true;
+                            lower = ih->lower_bound(range_key);
+                        } else if (cond.op == OP_LT) {
+                            // id < key: 到第一个 >= key 的位置结束（不包含）
+                            right_key = key_val - 1;  // 不包含key本身
+                            has_range = true;
+                            upper = ih->lower_bound(range_key);
+                        } else if (cond.op == OP_LE) {
+                            // id <= key: 到第一个 > key 的位置结束（不包含）
+                            right_key = key_val;  // 包含key本身
+                            has_range = true;
+                            upper = ih->upper_bound(range_key);
+                        }
+                    }
+                }
+                delete[] range_key;
+            } else {
+                // 多列索引：检查是否有等值条件匹配所有索引列
+                bool has_eq_cond = true;
+                std::vector<char> key(index_meta_.col_tot_len, 0);
+                int off = 0;
+                for (auto &col : index_meta_.cols) {
+                    bool found = false;
+                    for (auto &cond : conds_) {
+                        if (cond.is_rhs_val && cond.op == OP_EQ &&
+                            cond.lhs_col.tab_name == tab_name_ && cond.lhs_col.col_name == col.name) {
+                            memcpy(key.data() + off, cond.rhs_val.raw->data, col.len);
+                            off += col.len;
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        has_eq_cond = false;
+                        break;
+                    }
+                }
+                
+                if (has_eq_cond && off == index_meta_.col_tot_len) {
+                    // 有等值条件，使用等值扫描
+                    // 对于多列索引，暂时锁住整个表范围（简化处理）
+                    has_range = true;
+                    lower = ih->lower_bound(key.data());
+                    upper = ih->upper_bound(key.data());
+                }
+                // 否则使用全表扫描（lower和upper已经是leaf_begin和leaf_end）
+            }
+            
+            // 加间隙共享锁：锁住查询范围内的间隙，防止其他事务在该范围内插入/删除
+            if (context_ != nullptr && context_->txn_ != nullptr && context_->lock_mgr_ != nullptr) {
+                int tab_fd = fh_->GetFd();
+                if (has_range) {
+                    // 有明确的查询范围，锁住该范围
+                    if (!context_->lock_mgr_->lock_shared_on_gap(context_->txn_, tab_fd, left_key, right_key)) {
+                        throw std::runtime_error("Failed to acquire shared gap lock");
+                    }
+                } else {
+                    // 全表扫描，锁住整个键空间
+                    if (!context_->lock_mgr_->lock_shared_on_gap(context_->txn_, tab_fd, INT_MIN, INT_MAX)) {
+                        throw std::runtime_error("Failed to acquire shared gap lock");
+                    }
+                }
+            }
+            
             scan_ = std::make_unique<IxScan>(ih, lower, upper, sm_manager_->get_bpm());
         } else {
+            // 没有索引，退化为顺序扫描（使用表级S锁防止幻读）
+            if (context_ != nullptr && context_->txn_ != nullptr && context_->lock_mgr_ != nullptr) {
+                int tab_fd = fh_->GetFd();
+                if (!context_->lock_mgr_->lock_shared_on_table(context_->txn_, tab_fd)) {
+                    throw std::runtime_error("Failed to acquire shared lock on table");
+                }
+            }
             scan_ = std::make_unique<RmScan>(fh_);
         }
 

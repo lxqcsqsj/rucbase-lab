@@ -123,16 +123,17 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
             return eval_conds(joined);
         };
 
+        //找到第一对满足连接条件的记录
         while (!left_->is_end()) {
             while (!right_->is_end()) {
                 if (fed_conds_.empty() || curr_match()) {
-                    return;
+                    return;     //找到匹配对
                 }
                 right_->nextTuple();
             }
             left_->nextTuple();
             if (left_->is_end()) break;
-            right_->beginTuple();
+            right_->beginTuple();       //重置右表迭代器
         }
         isend = true;
     }
@@ -224,6 +225,7 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
         if (l == nullptr || r == nullptr) {
             return nullptr;
         }
+        //拼接左右记录
         auto rec = std::make_unique<RmRecord>(static_cast<int>(len_));
         memcpy(rec->data, l->data, left_->tupleLen());
         memcpy(rec->data + left_->tupleLen(), r->data, right_->tupleLen());

@@ -37,23 +37,52 @@ class DeleteExecutor : public AbstractExecutor {
     }
 
     std::unique_ptr<RmRecord> Next() override {
-        // 对每个 rid：先删索引 entry，再删记录
-        for (auto &rid : rids_) {
+        // 申请IX意向锁（表级）
+        if (context_ != nullptr && context_->txn_ != nullptr && context_->lock_mgr_ != nullptr) {
+            int tab_fd = fh_->GetFd();
+            if (!context_->lock_mgr_->lock_IX_on_table(context_->txn_, tab_fd)) {
+                throw std::runtime_error("Failed to acquire IX lock on table");
+            }
+        }
+        
+        for (Rid &rid : rids_) {
             auto rec = fh_->get_record(rid, context_);
-            if (rec == nullptr) {
-                continue;
-            }
-            for (auto &index : tab_.indexes) {
-                std::vector<char> key(index.col_tot_len);
-                int off = 0;
-                for (int i = 0; i < index.col_num; i++) {
-                    auto &col = index.cols[i];
-                    memcpy(key.data() + off, rec->data + col.offset, col.len);
-                    off += col.len;
+            // record a delete operation into the transaction (must be before deleting index/record)
+            WriteRecord *wr = new WriteRecord(WType::DELETE_TUPLE, tab_name_, rid, *rec);
+            context_->txn_->append_write_record(wr);
+            // Delete index and record index undo log
+            for (size_t i = 0; i < tab_.indexes.size(); ++i) {
+                auto &index = tab_.indexes[i];
+                auto ih =
+                    sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols)).get();
+                char *key = new char[index.col_tot_len];
+                int offset = 0;
+                for (int j = 0; j < index.col_num; ++j) {
+                    memcpy(key + offset, rec->data + index.cols[j].offset, index.cols[j].len);
+                    offset += index.cols[j].len;
                 }
-                auto ih = sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols)).get();
-                ih->delete_entry(key.data(), context_ ? context_->txn_ : nullptr);
+                
+                // 对于单列INT索引，加排它间隙锁：删除操作会改变键空间
+                if (context_ != nullptr && context_->txn_ != nullptr && context_->lock_mgr_ != nullptr &&
+                    index.col_num == 1 && index.cols[0].type == TYPE_INT) {
+                    int tab_fd = fh_->GetFd();
+                    int delete_key = *reinterpret_cast<int*>(key);
+                    // 尝试获取排它间隙锁
+                    if (!context_->lock_mgr_->lock_exclusive_on_gap(context_->txn_, tab_fd, delete_key, delete_key)) {
+                        delete[] key;
+                        throw std::runtime_error("Failed to acquire exclusive gap lock for delete");
+                    }
+                }
+                
+                // 删除索引条目
+                ih->delete_entry(key, context_->txn_);
+                
+                // 记录索引删除的 undo log：如果事务 abort，需要恢复这个索引条目
+                wr->AddIndexOp(index.cols, key, index.col_tot_len, rid, IndexOpType::INDEX_DELETE);
+                
+                delete[] key;
             }
+            // Delete record file
             fh_->delete_record(rid, context_);
         }
         return nullptr;

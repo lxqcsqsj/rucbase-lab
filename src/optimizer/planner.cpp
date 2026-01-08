@@ -150,13 +150,28 @@ std::shared_ptr<Plan> Planner::make_one_rel(std::shared_ptr<Query> query)
         // int index_no = get_indexNo(tables[i], curr_conds);
         std::vector<std::string> index_col_names;
         bool index_exist = get_index_cols(tables[i], curr_conds, index_col_names);
-        if (index_exist == false) {  // 该表没有索引
-            index_col_names.clear();
-            table_scan_executors[i] = 
-                std::make_shared<ScanPlan>(T_SeqScan, sm_manager_, tables[i], curr_conds, index_col_names);
-        } else {  // 存在索引
+        
+        // 如果WHERE条件匹配索引，使用IndexScan
+        if (index_exist) {
             table_scan_executors[i] =
                 std::make_shared<ScanPlan>(T_IndexScan, sm_manager_, tables[i], curr_conds, index_col_names);
+        } else {
+            // 即使没有WHERE条件，如果表有索引，也使用IndexScan来保证输出顺序一致（防止幻读）
+            TabMeta& tab = sm_manager_->db_.get_table(tables[i]);
+            if (!tab.indexes.empty()) {
+                // 使用第一个索引的列名
+                index_col_names.clear();
+                for (const auto& col : tab.indexes[0].cols) {
+                    index_col_names.push_back(col.name);
+                }
+                table_scan_executors[i] =
+                    std::make_shared<ScanPlan>(T_IndexScan, sm_manager_, tables[i], curr_conds, index_col_names);
+            } else {
+                // 表没有索引，使用SeqScan
+                index_col_names.clear();
+                table_scan_executors[i] = 
+                    std::make_shared<ScanPlan>(T_SeqScan, sm_manager_, tables[i], curr_conds, index_col_names);
+            }
         }
     }
     // 只有一个表，不需要join。

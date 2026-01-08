@@ -17,6 +17,13 @@ See the Mulan PSL v2 for more details. */
  * @return {unique_ptr<RmRecord>} rid对应的记录对象指针
  */
 std::unique_ptr<RmRecord> RmFileHandle::get_record(const Rid& rid, Context* context) const {
+    // 申请行级共享锁
+    if (context != nullptr && context->txn_ != nullptr && context->lock_mgr_ != nullptr) {
+        if (!context->lock_mgr_->lock_shared_on_record(context->txn_, rid, fd_)) {
+            throw std::runtime_error("Failed to acquire shared lock on record");
+        }
+    }
+    
     // 检查RID有效性
     if (rid.page_no < RM_FIRST_RECORD_PAGE || rid.page_no >= file_hdr_.num_pages) {
         throw std::runtime_error("Invalid page number");
@@ -151,6 +158,13 @@ void RmFileHandle::insert_record(const Rid& rid, char* buf) {
  * @param {Context*} context
  */
 void RmFileHandle::delete_record(const Rid& rid, Context* context) {
+    // 申请行级排他锁
+    if (context != nullptr && context->txn_ != nullptr && context->lock_mgr_ != nullptr) {
+        if (!context->lock_mgr_->lock_exclusive_on_record(context->txn_, rid, fd_)) {
+            throw std::runtime_error("Failed to acquire exclusive lock on record");
+        }
+    }
+    
     // 检查RID有效性
     if (rid.page_no < RM_FIRST_RECORD_PAGE || rid.page_no >= file_hdr_.num_pages) {
         throw std::runtime_error("Invalid page number");
@@ -195,6 +209,13 @@ void RmFileHandle::delete_record(const Rid& rid, Context* context) {
 void RmFileHandle::update_record(const Rid& rid, char* buf, Context* context) {
     if (buf == nullptr) {
         throw std::runtime_error("Buffer is null");
+    }
+    
+    // 申请行级排他锁
+    if (context != nullptr && context->txn_ != nullptr && context->lock_mgr_ != nullptr) {
+        if (!context->lock_mgr_->lock_exclusive_on_record(context->txn_, rid, fd_)) {
+            throw std::runtime_error("Failed to acquire exclusive lock on record");
+        }
     }
     
     // 检查RID有效性

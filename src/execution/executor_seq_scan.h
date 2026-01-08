@@ -58,8 +58,17 @@ class SeqScanExecutor : public AbstractExecutor {
      *
      */
     void beginTuple() override {
+        // 申请IS意向锁（表级）
+        if (context_ != nullptr && context_->txn_ != nullptr && context_->lock_mgr_ != nullptr) {
+            int tab_fd = fh_->GetFd();
+            if (!context_->lock_mgr_->lock_IS_on_table(context_->txn_, tab_fd)) {
+                throw std::runtime_error("Failed to acquire IS lock on table");
+            }
+        }
+        
         scan_ = std::make_unique<RmScan>(fh_);
 
+        //比较函数
         auto cmp = [](ColType type, const char *lhs, const char *rhs, int len) -> int {
             switch (type) {
                 case TYPE_INT: {
@@ -79,6 +88,7 @@ class SeqScanExecutor : public AbstractExecutor {
             }
         };
 
+        //单条件求值函数
         auto eval_cond = [&](const Condition &cond, const RmRecord &rec) -> bool {
             auto lhs_it = get_col(cols_, cond.lhs_col);
             const auto &lhs = *lhs_it;
@@ -102,6 +112,7 @@ class SeqScanExecutor : public AbstractExecutor {
             }
         };
 
+        //多条件
         auto eval_conds = [&](const RmRecord &rec) -> bool {
             for (auto &cond : fed_conds_) {
                 if (!eval_cond(cond, rec)) return false;

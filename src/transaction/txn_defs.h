@@ -11,10 +11,13 @@ See the Mulan PSL v2 for more details. */
 #pragma once
 
 #include <atomic>
+#include <vector>
+#include <cstring>
 
 #include "common/config.h"
 #include "defs.h"
 #include "record/rm_defs.h"
+#include "system/sm_meta.h"
 
 /* 标识事务状态 */
 enum class TransactionState { DEFAULT, GROWING, SHRINKING, COMMITTED, ABORTED };
@@ -24,6 +27,60 @@ enum class IsolationLevel { READ_UNCOMMITTED, REPEATABLE_READ, READ_COMMITTED, S
 
 /* 事务写操作类型，包括插入、删除、更新三种操作 */
 enum class WType { INSERT_TUPLE = 0, DELETE_TUPLE, UPDATE_TUPLE};
+
+/* 索引操作类型 */
+enum class IndexOpType { INDEX_INSERT = 0, INDEX_DELETE };
+
+/**
+ * @brief 索引操作的 undo log 记录
+ */
+struct IndexWriteRecord {
+    std::vector<ColMeta> index_cols;  // 索引包含的列，用于获取索引句柄
+    char* key;                         // 索引键值（动态分配）
+    size_t key_len;                    // 键值长度
+    Rid rid;                           // 记录的位置
+    IndexOpType op_type;               // 操作类型：INSERT 或 DELETE
+    
+    IndexWriteRecord() : key(nullptr), key_len(0) {}
+    
+    IndexWriteRecord(const std::vector<ColMeta>& cols, char* k, size_t len, const Rid& r, IndexOpType op)
+        : index_cols(cols), key(k), key_len(len), rid(r), op_type(op) {}
+    
+    ~IndexWriteRecord() {
+        if (key != nullptr) {
+            delete[] key;
+            key = nullptr;
+        }
+    }
+    
+    // 禁止拷贝构造和赋值，避免重复释放内存
+    IndexWriteRecord(const IndexWriteRecord&) = delete;
+    IndexWriteRecord& operator=(const IndexWriteRecord&) = delete;
+    
+    // 移动构造和移动赋值
+    IndexWriteRecord(IndexWriteRecord&& other) noexcept
+        : index_cols(std::move(other.index_cols)), key(other.key), key_len(other.key_len), 
+          rid(other.rid), op_type(other.op_type) {
+        other.key = nullptr;
+        other.key_len = 0;
+    }
+    
+    IndexWriteRecord& operator=(IndexWriteRecord&& other) noexcept {
+        if (this != &other) {
+            if (key != nullptr) {
+                delete[] key;
+            }
+            index_cols = std::move(other.index_cols);
+            key = other.key;
+            key_len = other.key_len;
+            rid = other.rid;
+            op_type = other.op_type;
+            other.key = nullptr;
+            other.key_len = 0;
+        }
+        return *this;
+    }
+};
 
 /**
  * @brief 事务的写操作记录，用于事务的回滚
@@ -48,7 +105,15 @@ class WriteRecord {
     WriteRecord(WType wtype, const std::string &tab_name, const Rid &rid, const RmRecord &record)
         : wtype_(wtype), tab_name_(tab_name), rid_(rid), record_(record) {}
 
-    ~WriteRecord() = default;
+    ~WriteRecord() {
+        // 清理索引操作的 key 内存
+        for (auto& idx_op : index_ops_) {
+            if (idx_op.key != nullptr) {
+                delete[] idx_op.key;
+                idx_op.key = nullptr;
+            }
+        }
+    }
 
     inline RmRecord &GetRecord() { return record_; }
 
@@ -57,16 +122,29 @@ class WriteRecord {
     inline WType &GetWriteType() { return wtype_; }
 
     inline std::string &GetTableName() { return tab_name_; }
+    
+    // 添加索引操作记录
+    void AddIndexOp(const std::vector<ColMeta>& index_cols, char* key, size_t key_len, 
+                    const Rid& rid, IndexOpType op_type) {
+        // 分配新的 key 内存并复制
+        char* new_key = new char[key_len];
+        memcpy(new_key, key, key_len);
+        index_ops_.emplace_back(index_cols, new_key, key_len, rid, op_type);
+    }
+    
+    // 获取索引操作列表
+    inline std::vector<IndexWriteRecord>& GetIndexOps() { return index_ops_; }
 
    private:
     WType wtype_;
     std::string tab_name_;
     Rid rid_;
     RmRecord record_;
+    std::vector<IndexWriteRecord> index_ops_;  // 索引操作的 undo log
 };
 
-/* 多粒度锁，加锁对象的类型，包括记录和表 */
-enum class LockDataType { TABLE = 0, RECORD = 1 };
+/* 多粒度锁，加锁对象的类型，包括表、记录和间隙（GAP） */
+enum class LockDataType { TABLE = 0, RECORD = 1, GAP = 2 };
 
 /**
  * @description: 加锁对象的唯一标识
@@ -82,9 +160,9 @@ class LockDataId {
         rid_.slot_no = -1;
     }
 
-    /* 行级锁 */
+    /* 行级锁 / 间隙锁：非表级的粒度都复用 (fd, rid) 作为唯一标识 */
     LockDataId(int fd, const Rid &rid, LockDataType type) {
-        assert(type == LockDataType::RECORD);
+        assert(type != LockDataType::TABLE);
         fd_ = fd;
         rid_ = rid;
         type_ = type;
@@ -92,18 +170,25 @@ class LockDataId {
 
     inline int64_t Get() const {
         if (type_ == LockDataType::TABLE) {
-            // fd_
+            // 表级锁：仅根据fd区分
             return static_cast<int64_t>(fd_);
-        } else {
-            // fd_, rid_.page_no, rid.slot_no
+        } else if (type_ == LockDataType::RECORD) {
+            // 行级锁：fd_, rid_.page_no, rid_.slot_no
             return ((static_cast<int64_t>(type_)) << 63) | ((static_cast<int64_t>(fd_)) << 31) |
                    ((static_cast<int64_t>(rid_.page_no)) << 16) | rid_.slot_no;
+        } else {  // LockDataType::GAP
+            // 间隙锁：同一张表上的所有gap共用一个锁ID（退化为表级间隙锁，简化冲突检测）
+            return ((static_cast<int64_t>(type_)) << 63) | (static_cast<int64_t>(fd_) << 31);
         }
     }
 
     bool operator==(const LockDataId &other) const {
         if (type_ != other.type_) return false;
         if (fd_ != other.fd_) return false;
+        if (type_ == LockDataType::GAP) {
+            // 所有gap视为同一资源
+            return true;
+        }
         return rid_ == other.rid_;
     }
     int fd_;

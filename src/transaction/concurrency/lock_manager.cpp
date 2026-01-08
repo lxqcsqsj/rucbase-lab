@@ -10,6 +10,23 @@ See the Mulan PSL v2 for more details. */
 
 #include "lock_manager.h"
 
+static inline bool check_lock(Transaction* txn) {
+    // 事务已经结束，不能再获取锁
+    if (txn->get_state() == TransactionState::COMMITTED || txn->get_state() == TransactionState::ABORTED) {
+        return false;
+    }
+    // 收缩状态不允许加锁
+    if (txn->get_state() == TransactionState::SHRINKING) {
+        // 抛出异常，在rmdb里abort
+        throw TransactionAbortException(txn->get_transaction_id(), AbortReason::LOCK_ON_SHIRINKING);
+    }
+    // 如果之前没加过锁，更新锁模式，开始2PL第一阶段
+    if (txn->get_state() == TransactionState::DEFAULT) {
+        txn->set_state(TransactionState::GROWING);
+    }
+    return true;
+}
+
 /**
  * @description: 申请行级共享锁
  * @return {bool} 加锁是否成功
@@ -18,7 +35,50 @@ See the Mulan PSL v2 for more details. */
  * @param {int} tab_fd
  */
 bool LockManager::lock_shared_on_record(Transaction* txn, const Rid& rid, int tab_fd) {
-    
+    std::unique_lock<std::mutex> lock(latch_);
+
+    if (!check_lock(txn)) return false;
+
+    // 得到记录的锁ID
+    LockDataId lockDataId(tab_fd, rid, LockDataType::RECORD);
+    // 如果锁表中不存在，使用分段构造构造map
+    if (lock_table_.count(lockDataId) == 0) {
+        lock_table_.emplace(std::piecewise_construct, std::forward_as_tuple(lockDataId), std::forward_as_tuple());
+    }
+    // 得到锁ID所在的锁请求队列和队列上的所有锁请求
+    auto& lockRequestQueue = lock_table_.at(lockDataId);
+    auto& lockRequests = lockRequestQueue.request_queue_;
+
+    // 事务上已经有这个记录的共享锁或排他锁了，判断为加锁成功
+    // select 加IS和S锁，对于S锁的申请直接通过，而不是升级为S
+    // 如果已经持有X锁，也可以直接读取（X锁包含S锁的所有权限）
+    for (auto& lockRequest : lockRequests) {
+        if (lockRequest.txn_id_ == txn->get_transaction_id()) {
+            // 如果已经持有X锁或S锁，都可以读取
+            if (lockRequest.lock_mode_ == LockMode::SHARED || 
+                lockRequest.lock_mode_ == LockMode::EXLUCSIVE) {
+                return true;
+            }
+        }
+    }
+
+    // 如果其他事务持有X锁，则加锁失败(no-wait)
+    if (lockRequestQueue.group_lock_mode_ == GroupLockMode::X ||
+        lockRequestQueue.group_lock_mode_ == GroupLockMode::IX ||
+        lockRequestQueue.group_lock_mode_ == GroupLockMode::SIX) {
+        // no-wait!
+        throw TransactionAbortException(txn->get_transaction_id(), AbortReason::DEADLOCK_PREVENTION);
+        // lockRequestQueue.cv_.wait(lock);
+    }
+
+    // 设置队列锁模式为共享锁
+    lockRequestQueue.group_lock_mode_ = GroupLockMode::S;
+    // 添加当前事务的锁请求到队列中
+    lockRequestQueue.request_queue_.emplace_back(txn->get_transaction_id(), LockMode::SHARED);
+    ++lockRequestQueue.shared_lock_num_;
+    // 成功申请共享锁
+    lockRequestQueue.request_queue_.back().granted_ = true;
+    txn->get_lock_set()->emplace(lockDataId);
     return true;
 }
 
@@ -30,7 +90,159 @@ bool LockManager::lock_shared_on_record(Transaction* txn, const Rid& rid, int ta
  * @param {int} tab_fd 记录所在的表的fd
  */
 bool LockManager::lock_exclusive_on_record(Transaction* txn, const Rid& rid, int tab_fd) {
+    std::unique_lock<std::mutex> lock(latch_);
 
+    if (!check_lock(txn)) return false;
+
+    // 得到记录的锁ID
+    LockDataId lockDataId(tab_fd, rid, LockDataType::RECORD);
+
+    // 如果锁表中不存在，使用分段构造构造map
+    if (lock_table_.count(lockDataId) == 0) {
+        lock_table_.emplace(std::piecewise_construct, std::forward_as_tuple(lockDataId), std::forward_as_tuple());
+    }
+    // 得到锁ID所在的锁请求队列和队列上的所有锁请求
+    auto& lockRequestQueue = lock_table_.at(lockDataId);
+    auto& lockRequests = lockRequestQueue.request_queue_;
+
+    for (auto& lockRequest : lockRequests) {
+        if (lockRequest.txn_id_ == txn->get_transaction_id()) {
+            // select后修改
+            // 多次修改
+            // 修改再select
+            if (lockRequest.lock_mode_ == LockMode::EXLUCSIVE) {
+                return true;
+            }
+            // 如果事务要升级为写锁，该记录不能有其他事务在读或写
+            // 检查是否只有当前事务持有S锁（其他事务可能已经释放）
+            else if (lockRequest.lock_mode_ == LockMode::SHARED) {
+                // 如果其他事务已经持有X锁，不能升级
+                if (lockRequestQueue.group_lock_mode_ == GroupLockMode::X) {
+                    throw TransactionAbortException(txn->get_transaction_id(), AbortReason::DEADLOCK_PREVENTION);
+                }
+                // 检查是否只有当前事务持有S锁
+                // 使用shared_lock_num_来检查，这比手动计数更准确
+                if (lockRequestQueue.shared_lock_num_ == 1) {
+                    lockRequest.lock_mode_ = LockMode::EXLUCSIVE;
+                    lockRequestQueue.group_lock_mode_ = GroupLockMode::X;
+                    --lockRequestQueue.shared_lock_num_;
+                    return true;
+                }
+            }
+            throw TransactionAbortException(txn->get_transaction_id(), AbortReason::DEADLOCK_PREVENTION);
+        }
+    }
+
+    // 如果其他事务持有其他锁（包括S锁），则加锁失败(no-wait)
+    // 这防止了lost update：如果其他事务持有S锁，当前事务不能获取X锁
+    if (lockRequestQueue.group_lock_mode_ != GroupLockMode::NON_LOCK) {
+        // no-wait!
+        throw TransactionAbortException(txn->get_transaction_id(), AbortReason::DEADLOCK_PREVENTION);
+        // lockRequestQueue.cv_.wait(lock);
+    }
+    // 设置队列锁模式为排他锁
+    lockRequestQueue.group_lock_mode_ = GroupLockMode::X;
+    // 添加当前事务的锁请求到队列中
+    lockRequestQueue.request_queue_.emplace_back(txn->get_transaction_id(), LockMode::EXLUCSIVE);
+    // 成功申请排他锁
+    lockRequestQueue.request_queue_.back().granted_ = true;
+    txn->get_lock_set()->emplace(lockDataId);
+    return true;
+}
+
+/**
+ * @description: 申请间隙共享锁（基于键空间的范围锁）
+ * @param {Transaction*} txn 要申请锁的事务对象指针
+ * @param {int} tab_fd 目标表的fd（用于区分不同表的键空间）
+ * @param {int} left_key 区间左边界（闭区间/开区间由调用方约定）
+ * @param {int} right_key 区间右边界
+ */
+bool LockManager::lock_shared_on_gap(Transaction* txn, int tab_fd, int left_key, int right_key) {
+    std::unique_lock<std::mutex> lock(latch_);
+
+    if (!check_lock(txn)) return false;
+
+    // 使用Rid的page_no/slot_no字段编码区间边界
+    Rid gap_id{left_key, right_key};
+    LockDataId lockDataId(tab_fd, gap_id, LockDataType::GAP);
+
+    if (lock_table_.count(lockDataId) == 0) {
+        lock_table_.emplace(std::piecewise_construct, std::forward_as_tuple(lockDataId), std::forward_as_tuple());
+    }
+    auto& lockRequestQueue = lock_table_.at(lockDataId);
+    auto& lockRequests = lockRequestQueue.request_queue_;
+
+    // 本事务已经在该区间上持有 S / X 锁，则直接成功
+    for (auto& req : lockRequests) {
+        if (req.txn_id_ == txn->get_transaction_id()) {
+            if (req.lock_mode_ == LockMode::SHARED || req.lock_mode_ == LockMode::EXLUCSIVE) {
+                return true;
+            }
+        }
+    }
+
+    // 其他事务持有 X 锁则失败（no-wait）
+    if (lockRequestQueue.group_lock_mode_ == GroupLockMode::X) {
+        throw TransactionAbortException(txn->get_transaction_id(), AbortReason::DEADLOCK_PREVENTION);
+    }
+
+    lockRequestQueue.group_lock_mode_ = GroupLockMode::S;
+    lockRequestQueue.request_queue_.emplace_back(txn->get_transaction_id(), LockMode::SHARED);
+    ++lockRequestQueue.shared_lock_num_;
+    lockRequestQueue.request_queue_.back().granted_ = true;
+    txn->get_lock_set()->emplace(lockDataId);
+    return true;
+}
+
+/**
+ * @description: 申请间隙排它锁（基于键空间的范围锁）
+ * @param {Transaction*} txn 要申请锁的事务对象指针
+ * @param {int} tab_fd 目标表的fd
+ * @param {int} left_key 区间左边界
+ * @param {int} right_key 区间右边界
+ */
+bool LockManager::lock_exclusive_on_gap(Transaction* txn, int tab_fd, int left_key, int right_key) {
+    std::unique_lock<std::mutex> lock(latch_);
+
+    if (!check_lock(txn)) return false;
+
+    Rid gap_id{left_key, right_key};
+    LockDataId lockDataId(tab_fd, gap_id, LockDataType::GAP);
+
+    if (lock_table_.count(lockDataId) == 0) {
+        lock_table_.emplace(std::piecewise_construct, std::forward_as_tuple(lockDataId), std::forward_as_tuple());
+    }
+    auto& lockRequestQueue = lock_table_.at(lockDataId);
+    auto& lockRequests = lockRequestQueue.request_queue_;
+
+    for (auto& req : lockRequests) {
+        if (req.txn_id_ == txn->get_transaction_id()) {
+            // 已经有 X 锁，直接成功
+            if (req.lock_mode_ == LockMode::EXLUCSIVE) {
+                return true;
+            }
+            // S -> X 升级：只有当前事务一个持有 S 锁时允许升级
+            if (req.lock_mode_ == LockMode::SHARED) {
+                if (lockRequestQueue.shared_lock_num_ == 1) {
+                    req.lock_mode_ = LockMode::EXLUCSIVE;
+                    lockRequestQueue.group_lock_mode_ = GroupLockMode::X;
+                    --lockRequestQueue.shared_lock_num_;
+                    return true;
+                }
+            }
+            throw TransactionAbortException(txn->get_transaction_id(), AbortReason::DEADLOCK_PREVENTION);
+        }
+    }
+
+    // 其他事务已经在该区间上持有任何锁，则不能再获取 X 锁（no-wait）
+    if (lockRequestQueue.group_lock_mode_ != GroupLockMode::NON_LOCK) {
+        throw TransactionAbortException(txn->get_transaction_id(), AbortReason::DEADLOCK_PREVENTION);
+    }
+
+    lockRequestQueue.group_lock_mode_ = GroupLockMode::X;
+    lockRequestQueue.request_queue_.emplace_back(txn->get_transaction_id(), LockMode::EXLUCSIVE);
+    lockRequestQueue.request_queue_.back().granted_ = true;
+    txn->get_lock_set()->emplace(lockDataId);
     return true;
 }
 
@@ -41,7 +253,66 @@ bool LockManager::lock_exclusive_on_record(Transaction* txn, const Rid& rid, int
  * @param {int} tab_fd 目标表的fd
  */
 bool LockManager::lock_shared_on_table(Transaction* txn, int tab_fd) {
-    
+    std::unique_lock<std::mutex> lock(latch_);
+
+    if (!check_lock(txn)) return false;
+
+    // 得到记录所在锁的请求队列
+    LockDataId lockDataId(tab_fd, LockDataType::TABLE);
+
+    // 如果锁表中不存在，使用分段构造构造map
+    if (lock_table_.count(lockDataId) == 0) {
+        lock_table_.emplace(std::piecewise_construct, std::forward_as_tuple(lockDataId), std::forward_as_tuple());
+    }
+    // 得到锁ID所在的锁请求队列和队列上的所有锁请求
+    auto& lockRequestQueue = lock_table_.at(lockDataId);
+    auto& lockRequests = lockRequestQueue.request_queue_;
+
+    for (auto& lockRequest : lockRequests) {
+        if (lockRequest.txn_id_ == txn->get_transaction_id()) {
+            // 在获取S锁之前，先获取IS锁或更高级别的锁
+            // 如果已经有S锁或更高级的锁，申请成功
+            if (lockRequest.lock_mode_ == LockMode::SHARED || lockRequest.lock_mode_ == LockMode::EXLUCSIVE ||
+                lockRequest.lock_mode_ == LockMode::S_IX) {
+                return true;
+            }
+            // 事务有IS锁，升级S需要其他事务不持有X锁
+            else if (lockRequest.lock_mode_ == LockMode::INTENTION_SHARED &&
+                     (lockRequestQueue.group_lock_mode_ == GroupLockMode::S ||
+                      lockRequestQueue.group_lock_mode_ == GroupLockMode::IS)) {
+                lockRequest.lock_mode_ = LockMode::SHARED;
+                lockRequestQueue.group_lock_mode_ = GroupLockMode::S;
+                ++lockRequestQueue.shared_lock_num_;
+                return true;
+            }
+            // 如果事务有IX锁，申请SIX需要其他事务不持有IX锁
+            else if (lockRequest.lock_mode_ == LockMode::INTENTION_EXCLUSIVE && lockRequestQueue.IX_lock_num_ == 1) {
+                lockRequest.lock_mode_ = LockMode::S_IX;
+                lockRequestQueue.group_lock_mode_ = GroupLockMode::SIX;
+                ++lockRequestQueue.shared_lock_num_;
+                return true;
+            }
+            throw TransactionAbortException(txn->get_transaction_id(), AbortReason::DEADLOCK_PREVENTION);
+        }
+    }
+
+    // 如果其他事务持有排他锁或者意向排它锁或SIX锁，则加锁失败(no-wait)
+    if (lockRequestQueue.group_lock_mode_ == GroupLockMode::X ||
+        lockRequestQueue.group_lock_mode_ == GroupLockMode::IX ||
+        lockRequestQueue.group_lock_mode_ == GroupLockMode::SIX) {
+        // no-wait!
+        throw TransactionAbortException(txn->get_transaction_id(), AbortReason::DEADLOCK_PREVENTION);
+        // lockRequestQueue.cv_.wait(lock);
+    }
+
+    // 设置队列锁模式为共享锁
+    lockRequestQueue.group_lock_mode_ = GroupLockMode::S;
+    // 添加当前事务的锁请求到队列中
+    lockRequestQueue.request_queue_.emplace_back(txn->get_transaction_id(), LockMode::SHARED);
+    ++lockRequestQueue.shared_lock_num_;
+    // 成功申请共享锁
+    lockRequestQueue.request_queue_.back().granted_ = true;
+    txn->get_lock_set()->emplace(lockDataId);
     return true;
 }
 
@@ -52,7 +323,50 @@ bool LockManager::lock_shared_on_table(Transaction* txn, int tab_fd) {
  * @param {int} tab_fd 目标表的fd
  */
 bool LockManager::lock_exclusive_on_table(Transaction* txn, int tab_fd) {
-    
+    std::unique_lock<std::mutex> lock(latch_);
+
+    if (!check_lock(txn)) return false;
+
+    // 得到记录所在锁的请求队列
+    LockDataId lockDataId(tab_fd, LockDataType::TABLE);
+
+    // 如果锁表中不存在，使用分段构造构造map
+    if (lock_table_.count(lockDataId) == 0) {
+        lock_table_.emplace(std::piecewise_construct, std::forward_as_tuple(lockDataId), std::forward_as_tuple());
+    }
+    // 得到锁ID所在的锁请求队列和队列上的所有锁请求
+    auto& lockRequestQueue = lock_table_.at(lockDataId);
+    auto& lockRequests = lockRequestQueue.request_queue_;
+
+    for (auto& lockRequest : lockRequests) {
+        if (lockRequest.txn_id_ == txn->get_transaction_id()) {
+            // 如果已经有排他锁，申请成功
+            if (lockRequest.lock_mode_ == LockMode::EXLUCSIVE) {
+                return true;
+            }
+            // 只允许存在一个事务才能升级表写锁
+            else if (lockRequests.size() == 1) {
+                lockRequest.lock_mode_ = LockMode::EXLUCSIVE;
+                lockRequestQueue.group_lock_mode_ = GroupLockMode::X;
+                return true;
+            }
+            throw TransactionAbortException(txn->get_transaction_id(), AbortReason::DEADLOCK_PREVENTION);
+        }
+    }
+
+    // 如果其他事务持有排他锁，则加锁失败(no-wait)
+    if (lockRequestQueue.group_lock_mode_ != GroupLockMode::NON_LOCK) {
+        // no-wait!
+        throw TransactionAbortException(txn->get_transaction_id(), AbortReason::DEADLOCK_PREVENTION);
+        // lockRequestQueue.cv_.wait(lock);
+    }
+    // 设置队列锁模式为排他锁
+    lockRequestQueue.group_lock_mode_ = GroupLockMode::X;
+    // 添加当前事务的锁请求到队列中
+    lockRequestQueue.request_queue_.emplace_back(txn->get_transaction_id(), LockMode::EXLUCSIVE);
+    lockRequestQueue.request_queue_.back().granted_ = true;
+    // 成功申请共享锁
+    txn->get_lock_set()->emplace(lockDataId);
     return true;
 }
 
@@ -63,7 +377,45 @@ bool LockManager::lock_exclusive_on_table(Transaction* txn, int tab_fd) {
  * @param {int} tab_fd 目标表的fd
  */
 bool LockManager::lock_IS_on_table(Transaction* txn, int tab_fd) {
-    
+    std::unique_lock<std::mutex> lock(latch_);
+
+    if (!check_lock(txn)) return false;
+
+    // 得到记录所在锁的请求队列
+    LockDataId lockDataId(tab_fd, LockDataType::TABLE);
+
+    // 如果锁表中不存在，使用分段构造构造map
+    if (lock_table_.count(lockDataId) == 0) {
+        lock_table_.emplace(std::piecewise_construct, std::forward_as_tuple(lockDataId), std::forward_as_tuple());
+    }
+    // 得到锁ID所在的锁请求队列和队列上的所有锁请求
+    auto& lockRequestQueue = lock_table_.at(lockDataId);
+    auto& lockRequests = lockRequestQueue.request_queue_;
+
+    // 如果队列中已经有这个事务
+    // 没有比IS锁更低级，直接申请成功
+    for (auto& lockRequest : lockRequests) {
+        if (lockRequest.txn_id_ == txn->get_transaction_id()) {
+            return true;
+        }
+    }
+
+    // 如果其他事务持有排他锁，则加锁失败(no-wait)
+    if (lockRequestQueue.group_lock_mode_ == GroupLockMode::X) {
+        // no-wait!
+        throw TransactionAbortException(txn->get_transaction_id(), AbortReason::DEADLOCK_PREVENTION);
+        // lockRequestQueue.cv_.wait(lock);
+    }
+
+    // 如果队列没有锁才设置队列锁模式为共享锁
+    if (lockRequestQueue.group_lock_mode_ == GroupLockMode::NON_LOCK) {
+        lockRequestQueue.group_lock_mode_ = GroupLockMode::IS;
+    }
+    // 添加当前事务的锁请求到队列中
+    lockRequestQueue.request_queue_.emplace_back(txn->get_transaction_id(), LockMode::INTENTION_SHARED);
+    lockRequestQueue.request_queue_.back().granted_ = true;
+    // 成功申请共享锁
+    txn->get_lock_set()->emplace(lockDataId);
     return true;
 }
 
@@ -74,7 +426,64 @@ bool LockManager::lock_IS_on_table(Transaction* txn, int tab_fd) {
  * @param {int} tab_fd 目标表的fd
  */
 bool LockManager::lock_IX_on_table(Transaction* txn, int tab_fd) {
-    
+    std::unique_lock<std::mutex> lock(latch_);
+
+    if (!check_lock(txn)) return false;
+
+    // 得到记录所在锁的请求队列
+    LockDataId lockDataId(tab_fd, LockDataType::TABLE);
+
+    // 如果锁表中不存在，使用分段构造构造map
+    if (lock_table_.count(lockDataId) == 0) {
+        lock_table_.emplace(std::piecewise_construct, std::forward_as_tuple(lockDataId), std::forward_as_tuple());
+    }
+    // 得到锁ID所在的锁请求队列和队列上的所有锁请求
+    auto& lockRequestQueue = lock_table_.at(lockDataId);
+    auto& lockRequests = lockRequestQueue.request_queue_;
+
+    for (auto& lockRequest : lockRequests) {
+        if (lockRequest.txn_id_ == txn->get_transaction_id()) {
+            // 如果已经有IX锁或更高级的锁，同一事务中多个写申请
+            if (lockRequest.lock_mode_ == LockMode::INTENTION_EXCLUSIVE || lockRequest.lock_mode_ == LockMode::S_IX ||
+                lockRequest.lock_mode_ == LockMode::EXLUCSIVE) {
+                return true;
+            }
+            // 如果事务有且持有唯一共享锁(where)，则升级为SIX
+            // 否则有多个事务持有共享锁，无法为其中的一个事务申请写锁，因为可能会影响其他事务读出来修改后的数据
+            else if (lockRequest.lock_mode_ == LockMode::SHARED && lockRequestQueue.shared_lock_num_ == 1) {
+                ++lockRequestQueue.IX_lock_num_;
+                lockRequest.lock_mode_ = LockMode::S_IX;
+                lockRequestQueue.group_lock_mode_ = GroupLockMode::SIX;
+                return true;
+            } else if (lockRequest.lock_mode_ == LockMode::INTENTION_SHARED &&
+                       (lockRequestQueue.group_lock_mode_ == GroupLockMode::IS ||
+                        lockRequestQueue.group_lock_mode_ == GroupLockMode::IX)) {
+                ++lockRequestQueue.IX_lock_num_;
+                lockRequest.lock_mode_ = LockMode::INTENTION_EXCLUSIVE;
+                lockRequestQueue.group_lock_mode_ = GroupLockMode::IX;
+                return true;
+            }
+            throw TransactionAbortException(txn->get_transaction_id(), AbortReason::DEADLOCK_PREVENTION);
+        }
+    }
+
+    // 得到记录所在锁的请求队列
+    // 如果其他事务持有共享(或SIX)锁和排它锁，则加锁失败(no-wait)
+    if (lockRequestQueue.group_lock_mode_ == GroupLockMode::S ||
+        lockRequestQueue.group_lock_mode_ == GroupLockMode::SIX ||
+        lockRequestQueue.group_lock_mode_ == GroupLockMode::X) {
+        // no-wait!
+        throw TransactionAbortException(txn->get_transaction_id(), AbortReason::DEADLOCK_PREVENTION);
+        // lockRequestQueue.cv_.wait(lock);
+    }
+    // 设置队列锁模式为意向排他锁
+    lockRequestQueue.group_lock_mode_ = GroupLockMode::IX;
+    // 添加当前事务的锁请求到队列中
+    lockRequestQueue.request_queue_.emplace_back(txn->get_transaction_id(), LockMode::INTENTION_EXCLUSIVE);
+    ++lockRequestQueue.IX_lock_num_;
+    // 成功申请意向排他锁
+    lockRequestQueue.request_queue_.back().granted_ = true;
+    txn->get_lock_set()->emplace(lockDataId);
     return true;
 }
 
@@ -85,6 +494,92 @@ bool LockManager::lock_IX_on_table(Transaction* txn, int tab_fd) {
  * @param {LockDataId} lock_data_id 要释放的锁ID
  */
 bool LockManager::unlock(Transaction* txn, LockDataId lock_data_id) {
-   
+    std::unique_lock<std::mutex> lock(latch_);
+
+    // 事务已经结束，不能再释放锁
+    if (txn->get_state() == TransactionState::COMMITTED || txn->get_state() == TransactionState::ABORTED) {
+        return false;
+    }
+    // 之前没有获得锁
+    if (txn->get_state() == TransactionState::DEFAULT) {
+        // 抛出异常，在rmdb里abort
+        // throw TransactionAbortException(txn->get_transaction_id(), AbortReason::LOCK_ON_SHIRINKING);
+    }
+    // 如果之前加过锁，更新锁模式，开始2PL第二阶段
+    if (txn->get_state() == TransactionState::GROWING) {
+        txn->set_state(TransactionState::SHRINKING);
+    }
+
+    // 找不到锁请求队列
+    if (lock_table_.count(lock_data_id) == 0) {
+        return true;
+    }
+
+    // 得到锁ID所在的锁请求队列和队列上的所有锁请求
+    auto& lockRequestQueue = lock_table_.at(lock_data_id);
+    auto& lockRequests = lockRequestQueue.request_queue_;
+
+    auto it = lockRequests.begin();
+    for (; it != lockRequests.end(); ++it) {
+        if (it->txn_id_ == txn->get_transaction_id()) {
+            break;
+        }
+    }
+    // 找不到事务对应的锁请求
+    // 先判断才能擦除，擦除后it会变成野指针
+    if (it == lockRequests.end()) return true;
+
+    // 更新队列S和IX数量
+    if (it->lock_mode_ == LockMode::SHARED || it->lock_mode_ == LockMode::S_IX) {
+        --lockRequestQueue.shared_lock_num_;
+    }
+    if (it->lock_mode_ == LockMode::INTENTION_EXCLUSIVE || it->lock_mode_ == LockMode::S_IX) {
+        --lockRequestQueue.IX_lock_num_;
+    }
+    // 删除事务的锁请求
+    lockRequests.erase(it);
+
+    if (lockRequests.empty()) {
+        lockRequestQueue.group_lock_mode_ = GroupLockMode::NON_LOCK;
+        return true;
+    }
+
+    // 锁队列不为空，需要重新计算group_lock_mode_
+    // 根据剩余的锁请求，找到最强的锁模式
+    bool has_X = false;
+    bool has_SIX = false;
+    bool has_S = false;
+    bool has_IX = false;
+    bool has_IS = false;
+    
+    for (auto& lockRequest : lockRequests) {
+        if (lockRequest.lock_mode_ == LockMode::EXLUCSIVE) {
+            has_X = true;
+        } else if (lockRequest.lock_mode_ == LockMode::S_IX) {
+            has_SIX = true;
+        } else if (lockRequest.lock_mode_ == LockMode::SHARED) {
+            has_S = true;
+        } else if (lockRequest.lock_mode_ == LockMode::INTENTION_EXCLUSIVE) {
+            has_IX = true;
+        } else if (lockRequest.lock_mode_ == LockMode::INTENTION_SHARED) {
+            has_IS = true;
+        }
+    }
+    
+    // 按照优先级设置group_lock_mode_（从强到弱）
+    if (has_X) {
+        lockRequestQueue.group_lock_mode_ = GroupLockMode::X;
+    } else if (has_SIX) {
+        lockRequestQueue.group_lock_mode_ = GroupLockMode::SIX;
+    } else if (has_S) {
+        lockRequestQueue.group_lock_mode_ = GroupLockMode::S;
+    } else if (has_IX) {
+        lockRequestQueue.group_lock_mode_ = GroupLockMode::IX;
+    } else if (has_IS) {
+        lockRequestQueue.group_lock_mode_ = GroupLockMode::IS;
+    } else {
+        lockRequestQueue.group_lock_mode_ = GroupLockMode::NON_LOCK;
+    }
+    
     return true;
 }

@@ -217,6 +217,10 @@ void SmManager::create_table(const std::string& tab_name, const std::vector<ColD
     if (db_.is_table(tab_name)) {
         throw TableExistsError(tab_name);
     }
+    
+    // 申请表级排他锁（创建表需要排他锁）
+    // 注意：由于表还未创建，这里无法获取fd，所以暂时不申请锁
+    // 实际上，创建表操作应该在元数据层面进行保护
     // Create table meta
     int curr_offset = 0;
     TabMeta tab;
@@ -237,6 +241,16 @@ void SmManager::create_table(const std::string& tab_name, const std::vector<ColD
     db_.tabs_[tab_name] = tab;
     // fhs_[tab_name] = rm_manager_->open_file(tab_name);
     fhs_.emplace(tab_name, rm_manager_->open_file(tab_name));
+    
+    // 申请表级排他锁（创建表需要排他锁）
+    // 注意：表创建后需要申请排他锁，但由于表刚创建，通常不会有并发问题
+    // 这里为了完整性，仍然申请锁
+    if (context != nullptr && context->txn_ != nullptr && context->lock_mgr_ != nullptr) {
+        int tab_fd = fhs_.at(tab_name)->GetFd();
+        if (!context->lock_mgr_->lock_exclusive_on_table(context->txn_, tab_fd)) {
+            throw std::runtime_error("Failed to acquire exclusive lock on table");
+        }
+    }
 
     flush_meta();
 }
@@ -249,6 +263,14 @@ void SmManager::create_table(const std::string& tab_name, const std::vector<ColD
 void SmManager::drop_table(const std::string& tab_name, Context* context) {
     if (!db_.is_table(tab_name)) {
         throw TableNotFoundError(tab_name);
+    }
+    
+    // 申请表级排他锁（删除表需要排他锁）
+    if (context != nullptr && context->txn_ != nullptr && context->lock_mgr_ != nullptr) {
+        int tab_fd = fhs_.at(tab_name)->GetFd();
+        if (!context->lock_mgr_->lock_exclusive_on_table(context->txn_, tab_fd)) {
+            throw std::runtime_error("Failed to acquire exclusive lock on table");
+        }
     }
     
     // 删除表上的所有索引
@@ -285,6 +307,14 @@ void SmManager::create_index(const std::string& tab_name, const std::vector<std:
     
     if (tab.is_index(col_names)) {
         throw IndexExistsError(tab_name, col_names);
+    }
+    
+    // 申请表级意向排他锁（创建索引需要IX锁）
+    if (context != nullptr && context->txn_ != nullptr && context->lock_mgr_ != nullptr) {
+        int tab_fd = fhs_.at(tab_name)->GetFd();
+        if (!context->lock_mgr_->lock_IX_on_table(context->txn_, tab_fd)) {
+            throw std::runtime_error("Failed to acquire IX lock on table");
+        }
     }
     
     std::vector<ColMeta> index_cols;
@@ -346,6 +376,14 @@ void SmManager::create_index(const std::string& tab_name, const std::vector<std:
  */
 void SmManager::drop_index(const std::string& tab_name, const std::vector<std::string>& col_names, Context* context) {
     TabMeta &tab = db_.get_table(tab_name);
+    
+    // 申请表级意向排他锁（删除索引需要IX锁）
+    if (context != nullptr && context->txn_ != nullptr && context->lock_mgr_ != nullptr) {
+        int tab_fd = fhs_.at(tab_name)->GetFd();
+        if (!context->lock_mgr_->lock_IX_on_table(context->txn_, tab_fd)) {
+            throw std::runtime_error("Failed to acquire IX lock on table");
+        }
+    }
     
     // 查找索引元数据
     auto index_it = tab.get_index_meta(col_names);

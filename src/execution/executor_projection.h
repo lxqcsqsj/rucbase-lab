@@ -55,12 +55,14 @@ class ProjectionExecutor : public AbstractExecutor {
         if (is_end()) {
             return nullptr;
         }
+        //从子算子获取记录
         auto prev_rec = prev_->Next();
         if (prev_rec == nullptr) {
             return nullptr;
         }
         auto rec = std::make_unique<RmRecord>(static_cast<int>(len_));
         auto &prev_cols = prev_->cols();
+        //复制
         for (size_t i = 0; i < sel_idxs_.size(); i++) {
             const auto &src_col = prev_cols[sel_idxs_[i]];
             const auto &dst_col = cols_[i];

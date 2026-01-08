@@ -40,6 +40,9 @@ class LockManager {
         std::list<LockRequest> request_queue_;  // 加锁队列
         std::condition_variable cv_;            // 条件变量，用于唤醒正在等待加锁的申请，在no-wait策略下无需使用
         GroupLockMode group_lock_mode_ = GroupLockMode::NON_LOCK;   // 加锁队列的锁模式
+
+        int shared_lock_num_ = 0;
+        int IX_lock_num_ = 0;
     };
 
 public:
@@ -50,6 +53,11 @@ public:
     bool lock_shared_on_record(Transaction* txn, const Rid& rid, int tab_fd);
 
     bool lock_exclusive_on_record(Transaction* txn, const Rid& rid, int tab_fd);
+
+    // 间隙锁：基于索引键空间的共享/排它锁，用 (left_key, right_key) 作为区间标识
+    bool lock_shared_on_gap(Transaction* txn, int tab_fd, int left_key, int right_key);
+
+    bool lock_exclusive_on_gap(Transaction* txn, int tab_fd, int left_key, int right_key);
 
     bool lock_shared_on_table(Transaction* txn, int tab_fd);
 

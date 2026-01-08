@@ -70,7 +70,7 @@ public:
 
 ```bash
 cd src/test/transaction
-python transaction_test.py
+python3 transaction_test.py
 ```
 
 本测试包含两个测试点，分别对事务的提交和回滚进行测试，测试点分数设置如下：
@@ -84,7 +84,7 @@ python transaction_test.py
 
 ```bash
 cd src/test/transaction
-python transaction_unit_test.py <test_case_name>
+python3 transaction_unit_test.py abort_test
 # The <test_case_name> should be one of the following options from the TESTS array:
 # 'commit_test', 'abort_test', 'commit_index_test', 'abort_index_test'
 # Replace <test_case_name> with the desired test case name to run that specific test.
@@ -183,8 +183,8 @@ private:
 ### 测试点及分数
 
 ```bash
-cd src/test/concurrency
-python concurrency_test.py
+cd ../concurrency
+python3 concurrency_test.py
 ```
 
 本测试包含六个测试点考虑，对应不同的数据异常：
@@ -202,7 +202,7 @@ python concurrency_test.py
 
 ```bash
 cd src/test/concurrency
-python concurrency_unit_test.py <test_case_name>
+python3 concurrency_unit_test.py lost_update_test
 # Run the unit test script with a specific test case name
 # The <test_case_name> should be one of the following options from the TESTS dictionary:
 # 'concurrency_read_test', 'dirty_write_test', 'dirty_read_test', 
@@ -226,8 +226,8 @@ python concurrency_unit_test.py <test_case_name>
 #### 测试点及分数
 
 ```bash
-cd src/test/transaction
-python transaction_test_bonus.py
+cd ../transaction
+python3 transaction_test_bonus.py
 ```
 
 本测试包含两个测试点，分别对事务的提交和回滚进行测试，测试点分数设置如下：
@@ -243,8 +243,8 @@ python transaction_test_bonus.py
 #### 测试点及分数
 
 ```bash
-cd src/test/concurrency
-python concurrency_test_bonus.py
+cd ../concurrency
+python3 concurrency_test_bonus.py
 ```
 
 本测试中包含四个测试点，每个分数点为5分，如果通过表锁的方式规避幻读数据异常，则最终得分为`(通过测试点数量)*5/2`，如果通过间隙锁的方式规避幻读数据异常，则最终得分为`(通过测试点数量)*5`
